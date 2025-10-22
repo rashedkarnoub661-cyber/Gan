@@ -1,0 +1,258 @@
+# train_dcgan.py
+import os
+import math
+import random
+from dataclasses import dataclass
+from typing import Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, utils
+
+# -------------------------
+# Config and deterministic setup
+# -------------------------
+@dataclass
+class Config:
+    data_dir: str = "data/faces"
+    out_dir: str = "outputs"
+    image_size: int = 64        # 64 or 128 (DCGAN-friendly)
+    channels: int = 3
+    batch_size: int = 128
+    num_workers: int = 4
+    epochs: int = 100
+    nz: int = 128               # latent vector size
+    ngf: int = 64               # generator feature maps
+    ndf: int = 64               # discriminator feature maps
+    lr_g: float = 2e-4
+    lr_d: float = 2e-4
+    beta1: float = 0.5
+    beta2: float = 0.999
+    gp_weight: float = 0.0      # gradient penalty (0 disables)
+    label_smooth: float = 0.9   # smooth real labels
+    aug_prob: float = 0.8       # probability to apply augmentation
+    sample_every: int = 1       # epochs
+    save_every: int = 10        # epochs
+    seed: int = 42
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# -------------------------
+# Data pipeline with augmentation
+# -------------------------
+def build_transforms(cfg: Config):
+    aug = transforms.RandomApply([
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1, hue=0.02),
+    ], p=cfg.aug_prob)
+
+    gaussian_noise = transforms.Lambda(
+        lambda x: x + torch.randn_like(x) * 0.02
+    )
+
+    return transforms.Compose([
+        transforms.Resize(cfg.image_size + 8),
+        transforms.CenterCrop(cfg.image_size),
+        transforms.RandomHorizontalFlip(p=0.5),
+        aug,
+        transforms.ToTensor(),
+        gaussian_noise,
+        transforms.Normalize(mean=[0.5]*cfg.channels, std=[0.5]*cfg.channels),  # -> [-1, 1]
+    ])
+
+def get_loader(cfg: Config):
+    tfm = build_transforms(cfg)
+    dataset = datasets.ImageFolder(root=cfg.data_dir, transform=tfm)
+    return DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
+                      num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+
+# -------------------------
+# Model definitions (DCGAN)
+# -------------------------
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1 or classname.find('ConvTranspose') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias.data)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.zeros_(m.bias.data)
+
+class Generator(nn.Module):
+    def __init__(self, nz: int, ngf: int, channels: int):
+        super().__init__()
+        self.main = nn.Sequential(
+            # Input: Z -> ngf*8 x 4 x 4
+            nn.ConvTranspose2d(nz, ngf*8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf*8), nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf*8, ngf*4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf*4), nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf*4, ngf*2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf*2), nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf*2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf), nn.ReLU(True),
+
+            nn.ConvTranspose2d(ngf, channels, 4, 2, 1, bias=False),
+            nn.Tanh()  # Output in [-1, 1]
+        )
+
+    def forward(self, z):
+        return self.main(z)
+
+class Discriminator(nn.Module):
+    def __init__(self, ndf: int, channels: int):
+        super().__init__()
+        sn = nn.utils.spectral_norm  # stabilize training
+        self.main = nn.Sequential(
+            sn(nn.Conv2d(channels, ndf, 4, 2, 1, bias=False)),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            sn(nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False)),
+            nn.BatchNorm2d(ndf*2),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            sn(nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False)),
+            nn.BatchNorm2d(ndf*4),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            sn(nn.Conv2d(ndf*4, ndf*8, 4, 2, 1, bias=False)),
+            nn.BatchNorm2d(ndf*8),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            sn(nn.Conv2d(ndf*8, 1, 4, 1, 0, bias=False)),
+            # no sigmoid; use BCEWithLogitsLoss for stability
+        )
+
+    def forward(self, x):
+        return self.main(x).view(-1, 1).squeeze(1)
+
+# -------------------------
+# Training utilities
+# -------------------------
+def gradient_penalty(disc: nn.Module, real: torch.Tensor, fake: torch.Tensor, device: str):
+    # WGAN-GP style penalty (optional)
+    bsz = real.size(0)
+    eps = torch.rand(bsz, 1, 1, 1, device=device)
+    interp = eps * real + (1 - eps) * fake
+    interp.requires_grad_(True)
+    pred = disc(interp)
+    grads = torch.autograd.grad(
+        outputs=pred, inputs=interp,
+        grad_outputs=torch.ones_like(pred),
+        create_graph=True, retain_graph=True, only_inputs=True
+    )[0]
+    gp = ((grads.view(bsz, -1).norm(2, dim=1) - 1) ** 2).mean()
+    return gp
+
+def save_samples(images: torch.Tensor, path: str, nrow: int = 8):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    utils.save_image(images, path, nrow=nrow, normalize=True, value_range=(-1, 1))
+
+# -------------------------
+# Main training loop
+# -------------------------
+def train(cfg: Config):
+    set_seed(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+
+    loader = get_loader(cfg)
+    device = torch.device(cfg.device)
+
+    netG = Generator(cfg.nz, cfg.ngf, cfg.channels).to(device)
+    netD = Discriminator(cfg.ndf, cfg.channels).to(device)
+
+    netG.apply(weights_init)
+    netD.apply(weights_init)
+
+    optG = torch.optim.Adam(netG.parameters(), lr=cfg.lr_g, betas=(cfg.beta1, cfg.beta2))
+    optD = torch.optim.Adam(netD.parameters(), lr=cfg.lr_d, betas=(cfg.beta1, cfg.beta2))
+
+    criterion = nn.BCEWithLogitsLoss()
+
+    fixed_noise = torch.randn(64, cfg.nz, 1, 1, device=device)
+
+    for epoch in range(1, cfg.epochs + 1):
+        netG.train(); netD.train()
+        for i, (real, _) in enumerate(loader):
+            real = real.to(device)
+            bsz = real.size(0)
+
+            # -----------------
+            # Train Discriminator
+            # -----------------
+            optD.zero_grad(set_to_none=True)
+
+            # Real
+            real_labels = torch.full((bsz,), cfg.label_smooth, device=device)
+            d_real = netD(real)
+            loss_real = criterion(d_real, real_labels)
+
+            # Fake
+            noise = torch.randn(bsz, cfg.nz, 1, 1, device=device)
+            fake = netG(noise).detach()
+            fake_labels = torch.zeros(bsz, device=device)
+            d_fake = netD(fake)
+            loss_fake = criterion(d_fake, fake_labels)
+
+            d_loss = loss_real + loss_fake
+
+            # Optional gradient penalty
+            if cfg.gp_weight > 0.0:
+                gp = gradient_penalty(netD, real, fake, device)
+                d_loss = d_loss + cfg.gp_weight * gp
+
+            d_loss.backward()
+            optD.step()
+
+            # -----------------
+            # Train Generator
+            # -----------------
+            optG.zero_grad(set_to_none=True)
+
+            noise = torch.randn(bsz, cfg.nz, 1, 1, device=device)
+            gen = netG(noise)
+            d_gen = netD(gen)
+            g_labels = torch.full((bsz,), 1.0, device=device)
+            g_loss = criterion(d_gen, g_labels)
+
+            g_loss.backward()
+            optG.step()
+
+            if (i + 1) % 50 == 0:
+                print(f"Epoch [{epoch}/{cfg.epochs}] Step [{i+1}/{len(loader)}] "
+                      f"D_loss: {d_loss.item():.4f} G_loss: {g_loss.item():.4f}")
+
+        # Sampling
+        if epoch % cfg.sample_every == 0:
+            netG.eval()
+            with torch.no_grad():
+                samples = netG(fixed_noise)
+            save_samples(samples, os.path.join(cfg.out_dir, f"samples_epoch_{epoch:03d}.png"))
+
+        # Checkpoint
+        if epoch % cfg.save_every == 0:
+            torch.save({
+                "epoch": epoch,
+                "netG": netG.state_dict(),
+                "netD": netD.state_dict(),
+                "optG": optG.state_dict(),
+                "optD": optD.state_dict(),
+                "cfg": cfg.__dict__,
+            }, os.path.join(cfg.out_dir, f"checkpoint_epoch_{epoch:03d}.pt"))
+
+    print("Training complete.")
+
+if __name__ == "__main__":
+    cfg = Config()
+    train(cfg)
