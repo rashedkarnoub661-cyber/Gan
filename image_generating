@@ -1,0 +1,259 @@
+import os
+import math
+import time
+import random
+import argparse
+from typing import Tuple, List
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+class Config:
+    data_dir = os.environ.get("GAN_FACES_DATA", "data/faces")
+    out_dir = os.environ.get("GAN_OUT", "gan_artifacts")
+    img_size = 64
+    channels = 3
+    batch_size = 128
+    epochs = 50
+    lr_g = 2e-4
+    lr_d = 2e-4
+    beta1 = 0.5
+    beta2 = 0.999
+    nz = 128
+    ngf = 64
+    ndf = 64
+    num_workers = 2
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    seed = 42
+    save_every = 5
+    sample_every = 1
+    samples_per_epoch = 64
+    augment_prob = 0.5
+    ckpt_g = "generator.pt"
+    ckpt_d = "discriminator.pt"
+
+cfg = Config()
+os.makedirs(cfg.out_dir, exist_ok=True)
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def get_transforms(img_size: int, augment_prob: float) -> transforms.Compose:
+    aug = []
+    aug.append(transforms.RandomHorizontalFlip(p=augment_prob))
+    aug.append(transforms.RandomApply([transforms.ColorJitter(0.1, 0.1, 0.1, 0.05)], p=augment_prob))
+    aug.append(transforms.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)))
+    tf = transforms.Compose([
+        transforms.Resize(img_size),
+        transforms.CenterCrop(img_size),
+        transforms.RandomApply(aug, p=augment_prob),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+    ])
+    return tf
+
+def load_dataset(data_dir: str, img_size: int, augment_prob: float) -> DataLoader:
+    if not os.path.exists(data_dir) or len(os.listdir(data_dir)) == 0:
+        os.makedirs(os.path.join(data_dir, "default"), exist_ok=True)
+        for i in range(64):
+            img = Image.fromarray((np.random.rand(img_size, img_size, 3)*255).astype(np.uint8))
+            img.save(os.path.join(data_dir, "default", f"rand_{i}.png"))
+    ds = ImageFolder(root=data_dir, transform=get_transforms(img_size, augment_prob))
+    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+    return dl
+
+class Generator(nn.Module):
+    def __init__(self, nz, ngf, channels):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(nz, ngf*8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf*8),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf*8, ngf*4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf*4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf*4, ngf*2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf*2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf*2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf, channels, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+    def forward(self, z):
+        return self.main(z)
+
+class Discriminator(nn.Module):
+    def __init__(self, channels, ndf):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(channels, ndf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf*2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf*4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf*4, ndf*8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ndf*8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf*8, 1, 4, 1, 0, bias=False),
+        )
+    def forward(self, x):
+        return self.main(x).view(-1)
+
+def weights_init(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    if isinstance(m, (nn.BatchNorm2d,)):
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+def save_images(tensor, path, nrow=8):
+    grid = torchvision.utils.make_grid(tensor, nrow=nrow, normalize=True, value_range=(-1, 1))
+    torchvision.utils.save_image(grid, path)
+
+def gradient_penalty(discriminator, real, fake, device="cpu", lambda_gp=0.0):
+    if lambda_gp == 0.0:
+        return torch.tensor(0.0, device=device)
+    bsz = real.size(0)
+    eps = torch.rand(bsz, 1, 1, 1, device=device)
+    interp = eps * real + (1 - eps) * fake
+    interp.requires_grad_(True)
+    pred = discriminator(interp)
+    grads = torch.autograd.grad(outputs=pred, inputs=interp,
+                                grad_outputs=torch.ones_like(pred),
+                                create_graph=True, retain_graph=True, only_inputs=True)[0]
+    gp = ((grads.view(bsz, -1).norm(2, dim=1) - 1) ** 2).mean()
+    return lambda_gp * gp
+
+def diversity_score(samples: torch.Tensor) -> float:
+    flat = samples.view(samples.size(0), -1)
+    flat = F.normalize(flat, p=2, dim=1)
+    sim = torch.mm(flat, flat.t())
+    mask = torch.ones_like(sim) - torch.eye(sim.size(0), device=sim.device)
+    mean_sim = (sim * mask).sum() / mask.sum()
+    return float(1.0 - mean_sim.item())
+
+def inception_like_score(fake_logits: torch.Tensor) -> float:
+    probs = torch.sigmoid(fake_logits).detach().cpu().numpy()
+    eps = 1e-8
+    p_mean = np.clip(np.mean(probs), eps, 1 - eps)
+    kl = probs * (np.log(np.clip(probs, eps, 1 - eps)) - np.log(p_mean))
+    return float(np.exp(np.mean(kl)))
+
+def train(dl: DataLoader, G: Generator, D: Discriminator, nz: int, epochs: int, device: str):
+    opt_g = torch.optim.Adam(G.parameters(), lr=cfg.lr_g, betas=(cfg.beta1, cfg.beta2))
+    opt_d = torch.optim.Adam(D.parameters(), lr=cfg.lr_d, betas=(cfg.beta1, cfg.beta2))
+    fixed_z = torch.randn(cfg.samples_per_epoch, nz, 1, 1, device=device)
+    criterion = nn.BCEWithLogitsLoss()
+    best_score = -float("inf")
+    for epoch in range(1, epochs + 1):
+        G.train(); D.train()
+        d_losses, g_losses = [], []
+        for real, _ in tqdm(dl, desc=f"Epoch {epoch}/{epochs}", leave=False):
+            real = real.to(device)
+            bsz = real.size(0)
+            z = torch.randn(bsz, nz, 1, 1, device=device)
+            fake = G(z)
+            d_real = D(real)
+            d_fake = D(fake.detach())
+            d_loss_real = criterion(d_real, torch.ones_like(d_real))
+            d_loss_fake = criterion(d_fake, torch.zeros_like(d_fake))
+            gp = gradient_penalty(D, real, fake.detach(), device=device, lambda_gp=0.0)
+            d_loss = d_loss_real + d_loss_fake + gp
+            opt_d.zero_grad()
+            d_loss.backward()
+            opt_d.step()
+            z = torch.randn(bsz, nz, 1, 1, device=device)
+            fake = G(z)
+            d_fake_for_g = D(fake)
+            g_loss = criterion(d_fake_for_g, torch.ones_like(d_fake_for_g))
+            opt_g.zero_grad()
+            g_loss.backward()
+            opt_g.step()
+            d_losses.append(d_loss.item())
+            g_losses.append(g_loss.item())
+        with torch.no_grad():
+            G.eval()
+            samples = G(fixed_z)
+            d_eval = D(samples)
+            div = diversity_score(samples)
+            inc = inception_like_score(d_eval)
+            score = div + inc
+        print(f"Epoch {epoch}: D_loss={np.mean(d_losses):.4f} G_loss={np.mean(g_losses):.4f} Diversity={div:.3f} IS~={inc:.3f}")
+        if epoch % cfg.sample_every == 0:
+            save_images(samples, os.path.join(cfg.out_dir, f"samples_epoch_{epoch}.png"), nrow=int(math.sqrt(cfg.samples_per_epoch)))
+        if epoch % cfg.save_every == 0 or score > best_score:
+            best_score = score
+            torch.save({"state_dict": G.state_dict(), "nz": nz}, os.path.join(cfg.out_dir, cfg.ckpt_g))
+            torch.save({"state_dict": D.state_dict()}, os.path.join(cfg.out_dir, cfg.ckpt_d))
+
+def generate_samples(n: int, nz: int, device: str, out_dir: str, ckpt_path: str, img_size: int):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    G = Generator(nz=ckpt.get("nz", nz), ngf=cfg.ngf, channels=cfg.channels).to(device)
+    G.load_state_dict(ckpt["state_dict"])
+    G.eval()
+    z = torch.randn(n, nz, 1, 1, device=device)
+    with torch.no_grad():
+        imgs = G(z).cpu()
+    save_images(imgs, os.path.join(out_dir, f"generated_{n}.png"), nrow=int(math.sqrt(n)))
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", type=str, default=cfg.data_dir)
+    p.add_argument("--out_dir", type=str, default=cfg.out_dir)
+    p.add_argument("--img_size", type=int, default=cfg.img_size)
+    p.add_argument("--epochs", type=int, default=cfg.epochs)
+    p.add_argument("--batch_size", type=int, default=cfg.batch_size)
+    p.add_argument("--nz", type=int, default=cfg.nz)
+    p.add_argument("--ngf", type=int, default=cfg.ngf)
+    p.add_argument("--ndf", type=int, default=cfg.ndf)
+    p.add_argument("--augment_prob", type=float, default=cfg.augment_prob)
+    p.add_argument("--generate_only", action="store_true")
+    p.add_argument("--num_generate", type=int, default=64)
+    p.add_argument("--ckpt_g", type=str, default=os.path.join(cfg.out_dir, cfg.ckpt_g))
+    return p.parse_args()
+
+def main():
+    set_seed(cfg.seed)
+    args = parse_args()
+    cfg.data_dir = args.data_dir
+    cfg.out_dir = args.out_dir
+    cfg.img_size = args.img_size
+    cfg.epochs = args.epochs
+    cfg.batch_size = args.batch_size
+    cfg.nz = args.nz
+    cfg.ngf = args.ngf
+    cfg.ndf = args.ndf
+    cfg.augment_prob = args.augment_prob
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    if args.generate_only and os.path.exists(args.ckpt_g):
+        generate_samples(args.num_generate, cfg.nz, cfg.device, cfg.out_dir, args.ckpt_g, cfg.img_size)
+        print("Samples saved.")
+        return
+    dl = load_dataset(cfg.data_dir, cfg.img_size, cfg.augment_prob)
+    G = Generator(nz=cfg.nz, ngf=cfg.ngf, channels=cfg.channels).to(cfg.device)
+    D = Discriminator(channels=cfg.channels, ndf=cfg.ndf).to(cfg.device)
+    G.apply(weights_init); D.apply(weights_init)
+    train(dl, G, D, cfg.nz, cfg.epochs, cfg.device)
+    generate_samples(64, cfg.nz, cfg.device, cfg.out_dir, os.path.join(cfg.out_dir, cfg.ckpt_g), cfg.img_size)
+    print("Training complete.")
+
+if __name__ == "__main__":
+    main()
+
+
+           
